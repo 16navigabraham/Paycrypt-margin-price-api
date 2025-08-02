@@ -1,21 +1,17 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const NodeCache = require('node-cache');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Cache prices for 2 minutes to avoid rate limiting
-const cache = new NodeCache({ stdTTL: 120 });
-
-// CORS configuration for your Vercel frontend
+// CORS configuration
 const corsOptions = {
   origin: [
     'https://paycryptv1.vercel.app',
     'http://localhost:3000',
     'http://localhost:3001',
-    'http://localhost:5173', // For Vite dev server
+    'http://localhost:5173',
     'http://127.0.0.1:3000'
   ],
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -25,128 +21,268 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// Your margin in Naira (change this to whatever you want)
+// Your margin in Naira
 const MARGIN_NGN = 10;
+
+// Enhanced caching with longer duration
+let globalCache = {};
+let lastFetchTime = 0;
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes cache
+const MIN_REQUEST_INTERVAL = 30000; // 30 seconds between CoinGecko calls
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  const cacheStats = cache.getStats();
+  const cacheAge = Date.now() - lastFetchTime;
   res.json({ 
     success: true, 
-    message: 'Margin API is running! 🚀',
+    message: 'PayCrypt Margin API is running! 🚀',
     margin: `Adding ${MARGIN_NGN} NGN to all prices`,
-    cache: {
-      keys: cache.keys().length,
-      hits: cacheStats.hits,
-      misses: cacheStats.misses
+    cache_status: {
+      has_data: Object.keys(globalCache).length > 0,
+      cache_age_seconds: Math.floor(cacheAge / 1000),
+      cache_valid: cacheAge < CACHE_DURATION
+    },
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    name: 'PayCrypt Margin Price API',
+    description: 'Crypto prices with NGN margin',
+    version: '1.0.0',
+    endpoints: {
+      health: '/health',
+      prices: '/api/v3/simple/price?ids=tether,usd-coin,ethereum&vs_currencies=ngn,usd'
     }
   });
 });
 
-// Main endpoint - exactly like CoinGecko but with your margin
-app.get('/api/v3/simple/price', async (req, res) => {
+// Function to fetch from multiple sources if needed
+async function fetchPricesWithFallback(tokenIds, currencies) {
+  const ids = tokenIds.join(',');
+  
+  // Primary: CoinGecko API
   try {
-    const { ids, vs_currencies } = req.query;
+    console.log(`🔄 Attempting CoinGecko fetch for: ${ids}`);
     
-    // Create cache key
-    const cacheKey = `${ids}_${vs_currencies}`;
-    
-    // Check cache first
-    const cachedData = cache.get(cacheKey);
-    if (cachedData) {
-      console.log(`💾 Cache HIT for: ${ids}`);
-      return res.json(cachedData);
-    }
-    
-    console.log(`📊 Cache MISS - Fetching fresh prices for: ${ids}`);
-    
-    // Get original prices from CoinGecko with delay to avoid rate limiting
-    const coinGeckoUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=${vs_currencies}`;
-    
-    // Add delay between requests to avoid rate limiting
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    const response = await axios.get(coinGeckoUrl, { 
-      timeout: 15000,
+    const response = await axios.get(`https://api.coingecko.com/api/v3/simple/price`, {
+      params: {
+        ids: ids,
+        vs_currencies: currencies,
+        include_24hr_change: false
+      },
+      timeout: 25000,
       headers: {
         'Accept': 'application/json',
-        'User-Agent': 'PayCrypt-Margin-API/1.0'
+        'User-Agent': 'Mozilla/5.0 (compatible; PayCrypt/1.0)'
       }
     });
     
-    const originalData = response.data;
-    const modifiedData = {};
+    if (response.data && Object.keys(response.data).length > 0) {
+      console.log('✅ CoinGecko fetch successful');
+      return response.data;
+    }
+  } catch (error) {
+    console.log(`⚠️ CoinGecko failed: ${error.message}`);
     
-    // Add your margin to NGN prices only
+    // If rate limited, try with longer delay
+    if (error.response?.status === 429) {
+      console.log('⏳ Rate limited, trying fallback approach...');
+      
+      // Try fetching tokens one by one with delays
+      const results = {};
+      for (const tokenId of tokenIds) {
+        try {
+          await new Promise(resolve => setTimeout(resolve, 10000)); // 10s delay between tokens
+          const singleResponse = await axios.get(`https://api.coingecko.com/api/v3/simple/price`, {
+            params: {
+              ids: tokenId,
+              vs_currencies: currencies
+            },
+            timeout: 30000,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (compatible; PayCrypt/1.0)'
+            }
+          });
+          
+          if (singleResponse.data[tokenId]) {
+            results[tokenId] = singleResponse.data[tokenId];
+            console.log(`✅ Fetched ${tokenId} individually`);
+          }
+        } catch (singleError) {
+          console.log(`❌ Failed to fetch ${tokenId}: ${singleError.message}`);
+        }
+      }
+      
+      if (Object.keys(results).length > 0) {
+        return results;
+      }
+    }
+  }
+  
+  // If all fails, return null
+  throw new Error('All fetch attempts failed');
+}
+
+// Main endpoint
+app.get('/api/v3/simple/price', async (req, res) => {
+  try {
+    const { ids, vs_currencies = 'ngn,usd' } = req.query;
+    
+    if (!ids) {
+      return res.status(400).json({
+        error: 'Missing ids parameter',
+        example: '/api/v3/simple/price?ids=tether,ethereum&vs_currencies=ngn,usd'
+      });
+    }
+    
+    const tokenIds = ids.split(',').map(id => id.trim());
+    const now = Date.now();
+    
+    // Check if we have valid cached data
+    const cacheAge = now - lastFetchTime;
+    const hasValidCache = Object.keys(globalCache).length > 0 && cacheAge < CACHE_DURATION;
+    
+    if (hasValidCache) {
+      console.log(`💾 Serving cached data (${Math.floor(cacheAge/1000)}s old)`);
+      
+      // Filter cached data for requested tokens
+      const cachedResults = {};
+      tokenIds.forEach(tokenId => {
+        if (globalCache[tokenId]) {
+          cachedResults[tokenId] = globalCache[tokenId];
+        }
+      });
+      
+      if (Object.keys(cachedResults).length > 0) {
+        return res.json(cachedResults);
+      }
+    }
+    
+    // Check minimum interval between requests
+    const timeSinceLastFetch = now - lastFetchTime;
+    if (timeSinceLastFetch < MIN_REQUEST_INTERVAL && Object.keys(globalCache).length > 0) {
+      console.log(`⏰ Too soon since last fetch (${Math.floor(timeSinceLastFetch/1000)}s ago), serving cache`);
+      const cachedResults = {};
+      tokenIds.forEach(tokenId => {
+        if (globalCache[tokenId]) {
+          cachedResults[tokenId] = globalCache[tokenId];
+        }
+      });
+      return res.json(cachedResults);
+    }
+    
+    console.log(`📊 Fetching fresh data for: ${ids}`);
+    
+    // Fetch new data
+    const originalData = await fetchPricesWithFallback(tokenIds, vs_currencies);
+    
+    if (!originalData || Object.keys(originalData).length === 0) {
+      // Return stale cache if available
+      if (Object.keys(globalCache).length > 0) {
+        console.log('⚠️ No fresh data, serving stale cache');
+        const staleResults = {};
+        tokenIds.forEach(tokenId => {
+          if (globalCache[tokenId]) {
+            staleResults[tokenId] = globalCache[tokenId];
+          }
+        });
+        return res.json(staleResults);
+      }
+      
+      return res.status(503).json({
+        error: 'Service temporarily unavailable',
+        message: 'Unable to fetch price data at the moment'
+      });
+    }
+    
+    // Process and cache the data
+    const processedData = {};
+    
     Object.entries(originalData).forEach(([tokenId, prices]) => {
-      modifiedData[tokenId] = {
-        usd: prices.usd, // Keep USD price unchanged
-        ngn: prices.ngn ? prices.ngn + MARGIN_NGN : prices.ngn // Add margin to NGN
+      processedData[tokenId] = {
+        usd: prices.usd,
+        ngn: prices.ngn ? prices.ngn + MARGIN_NGN : prices.ngn
       };
+      
+      // Update global cache
+      globalCache[tokenId] = processedData[tokenId];
     });
     
-    // Cache the modified data
-    cache.set(cacheKey, modifiedData);
+    lastFetchTime = now;
     
-    // Log the changes (you'll see this in Render logs)
-    console.log('🏷️ Original NGN prices:', 
-      Object.fromEntries(Object.entries(originalData).map(([token, prices]) => [token, prices.ngn]))
-    );
-    console.log('💰 Your NGN prices (+10):', 
-      Object.fromEntries(Object.entries(modifiedData).map(([token, prices]) => [token, prices.ngn]))
+    console.log(`✅ Successfully processed ${Object.keys(processedData).length} tokens`);
+    console.log('💰 NGN prices with margin:', 
+      Object.fromEntries(Object.entries(processedData).map(([token, prices]) => [token, prices.ngn]))
     );
     
-    // Send modified data to your frontend
-    res.json(modifiedData);
+    res.json(processedData);
     
   } catch (error) {
-    console.error('❌ Error fetching prices:', error.message);
+    console.error('❌ Error in main endpoint:', error.message);
     
-    // If it's a rate limit error, try to serve stale cache data
-    if (error.response?.status === 429) {
-      const { ids, vs_currencies } = req.query;
-      const cacheKey = `${ids}_${vs_currencies}`;
-      const staleData = cache.get(cacheKey);
+    // Try to serve any available cached data
+    if (Object.keys(globalCache).length > 0) {
+      console.log('🆘 Error occurred, serving any available cached data');
+      const { ids } = req.query;
+      const tokenIds = ids ? ids.split(',').map(id => id.trim()) : [];
       
-      if (staleData) {
-        console.log('⚠️ Rate limited - serving stale cache data');
+      const emergency = {};
+      tokenIds.forEach(tokenId => {
+        if (globalCache[tokenId]) {
+          emergency[tokenId] = globalCache[tokenId];
+        }
+      });
+      
+      if (Object.keys(emergency).length > 0) {
         return res.json({
-          ...staleData,
-          _warning: 'Using cached data due to rate limiting'
+          ...emergency,
+          _warning: 'Using cached data due to API issues',
+          _cache_age: Math.floor((Date.now() - lastFetchTime) / 1000)
         });
       }
     }
     
-    // Send error response
     res.status(500).json({
       error: 'Failed to fetch prices',
-      message: error.response?.status === 429 ? 
-        'Rate limited by CoinGecko. Please try again in a moment.' : 
-        error.message
+      message: 'Service temporarily unavailable. Please try again in a few minutes.',
+      retry_after: 60
     });
   }
 });
 
-// Cache stats endpoint
-app.get('/cache/stats', (req, res) => {
-  const stats = cache.getStats();
+// Cache info endpoint
+app.get('/cache/info', (req, res) => {
+  const cacheAge = Date.now() - lastFetchTime;
   res.json({
     success: true,
     cache: {
-      keys: cache.keys().length,
-      hits: stats.hits,
-      misses: stats.misses,
-      hitRate: stats.hits / (stats.hits + stats.misses) || 0
+      tokens: Object.keys(globalCache),
+      count: Object.keys(globalCache).length,
+      age_seconds: Math.floor(cacheAge / 1000),
+      valid: cacheAge < CACHE_DURATION,
+      last_fetch: new Date(lastFetchTime).toISOString()
     }
   });
 });
 
-// Start the server
+// Catch all
+app.use('*', (req, res) => {
+  res.status(404).json({
+    error: 'Not Found',
+    message: `${req.method} ${req.originalUrl} not found`,
+    available: ['GET /', 'GET /health', 'GET /api/v3/simple/price']
+  });
+});
+
 app.listen(PORT, () => {
-  console.log(`🚀 Margin API is running on port ${PORT}`);
-  console.log(`💰 Adding ${MARGIN_NGN} NGN margin to all crypto prices`);
-  console.log(`💾 Caching enabled for 2 minutes to avoid rate limits`);
-  console.log(`🌐 Visit /health to check if everything is working`);
+  console.log(`🚀 PayCrypt Margin API running on port ${PORT}`);
+  console.log(`💰 NGN margin: +${MARGIN_NGN}`);
+  console.log(`💾 Cache duration: ${CACHE_DURATION/1000/60} minutes`);
+  console.log(`⏰ Min request interval: ${MIN_REQUEST_INTERVAL/1000} seconds`);
 });
 
 module.exports = app;
