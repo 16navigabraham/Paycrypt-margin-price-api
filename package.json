@@ -1,0 +1,17 @@
+{
+  "name": "margin-price-api",
+  "version": "1.0.0",
+  "description": "Simple API that adds 10 NGN margin to crypto prices",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
