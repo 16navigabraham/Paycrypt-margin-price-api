@@ -9,8 +9,8 @@ const PORT = process.env.PORT || 3000;
 app.use(cors({
   origin: [
     'https://paycryptv1.vercel.app',
-    'http://localhost:3000',
-    'http://localhost:3001',
+    'https://www.paycrypt.org',
+    'https://paycrypt.org',
     'http://localhost:5173'
   ]
 }));
