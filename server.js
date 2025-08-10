@@ -18,7 +18,7 @@ app.use(cors({
 }));
 
 // Your margin in Naira
-const MARGIN_NGN = 15;
+const MARGIN_NGN = 20;
 
 // Enhanced cache with longer duration to reduce API calls
 let priceCache = {};
