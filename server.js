@@ -1,11 +1,13 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS configuration
+// CORS configuration (unchanged)
 app.use(cors({
   origin: [
     'https://paycryptv1.vercel.app',
@@ -20,38 +22,165 @@ app.use(cors({
 // Your margin in Naira
 const MARGIN_NGN = 20;
 
-// MAXIMIZED cache settings - serve CoinGecko data for much longer
-let priceCache = {};
-let lastUpdate = 0;
-const CACHE_DURATION = 60 * 60 * 1000; // 1 HOUR cache (instead of 10 minutes)
-const MIN_REQUEST_INTERVAL = 15 * 60 * 1000; // 15 MINUTES between CoinGecko calls (instead of 1 minute)
-const STALE_CACHE_DURATION = 24 * 60 * 60 * 1000; // Serve stale data for up to 24 HOURS
+// Database setup
+const dbPath = path.join(__dirname, 'price_cache.db');
+const db = new sqlite3.Database(dbPath);
 
-// Track request timing
+// Initialize database
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS price_cache (
+    token_id TEXT PRIMARY KEY,
+    usd_price REAL,
+    ngn_price REAL,
+    original_ngn REAL,
+    last_updated INTEGER,
+    source TEXT DEFAULT 'coingecko'
+  )`);
+  
+  db.run(`CREATE TABLE IF NOT EXISTS api_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    endpoint TEXT,
+    status TEXT,
+    timestamp INTEGER,
+    response_time INTEGER,
+    tokens_requested TEXT
+  )`);
+});
+
+// In-memory cache (for speed) + Database (for persistence)
+let memoryCache = {};
+let lastUpdate = 0;
+const CACHE_DURATION = 60 * 60 * 1000; // 1 HOUR
+const MIN_REQUEST_INTERVAL = 20 * 60 * 1000; // 20 MINUTES (increased from 15)
+const STALE_CACHE_DURATION = 48 * 60 * 60 * 1000; // 48 HOURS (increased from 24)
+
 let lastRequestTime = 0;
 let requestCount = 0;
 
-// Health endpoint
+// Database helper functions
+function saveToDatabase(tokenData) {
+  return new Promise((resolve, reject) => {
+    const stmt = db.prepare(`INSERT OR REPLACE INTO price_cache 
+      (token_id, usd_price, ngn_price, original_ngn, last_updated, source) 
+      VALUES (?, ?, ?, ?, ?, ?)`);
+    
+    const timestamp = Date.now();
+    
+    Object.entries(tokenData).forEach(([tokenId, prices]) => {
+      stmt.run([
+        tokenId,
+        prices.usd || null,
+        prices.ngn || null,
+        prices.ngn ? prices.ngn - MARGIN_NGN : null,
+        timestamp,
+        'coingecko'
+      ]);
+    });
+    
+    stmt.finalize((err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+function loadFromDatabase(tokenIds = null) {
+  return new Promise((resolve, reject) => {
+    let query = 'SELECT * FROM price_cache';
+    let params = [];
+    
+    if (tokenIds && tokenIds.length > 0) {
+      const placeholders = tokenIds.map(() => '?').join(',');
+      query += ` WHERE token_id IN (${placeholders})`;
+      params = tokenIds;
+    }
+    
+    db.all(query, params, (err, rows) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      
+      const data = {};
+      rows.forEach(row => {
+        data[row.token_id] = {
+          usd: row.usd_price,
+          ngn: row.ngn_price
+        };
+      });
+      
+      resolve(data);
+    });
+  });
+}
+
+function logApiCall(endpoint, status, responseTime, tokensRequested) {
+  const stmt = db.prepare(`INSERT INTO api_metrics 
+    (endpoint, status, timestamp, response_time, tokens_requested) 
+    VALUES (?, ?, ?, ?, ?)`);
+  
+  stmt.run([
+    endpoint,
+    status,
+    Date.now(),
+    responseTime,
+    tokensRequested
+  ]);
+  
+  stmt.finalize();
+}
+
+// Load cache from database on startup
+async function initializeCache() {
+  try {
+    console.log('📚 Loading cache from database...');
+    const dbData = await loadFromDatabase();
+    
+    if (Object.keys(dbData).length > 0) {
+      memoryCache = dbData;
+      // Find the most recent update time
+      db.get('SELECT MAX(last_updated) as latest FROM price_cache', (err, row) => {
+        if (!err && row.latest) {
+          lastUpdate = row.latest;
+          const ageMinutes = Math.floor((Date.now() - row.latest) / 60000);
+          console.log(`✅ Loaded ${Object.keys(dbData).length} tokens from database (${ageMinutes} min old)`);
+        }
+      });
+    } else {
+      console.log('📭 Database is empty - will fetch fresh data');
+    }
+  } catch (error) {
+    console.error('❌ Error loading from database:', error.message);
+  }
+}
+
+// Health endpoint with database info
 app.get('/health', (req, res) => {
   const cacheAge = Math.floor((Date.now() - lastUpdate) / 1000);
   const timeSinceLastRequest = Math.floor((Date.now() - lastRequestTime) / 1000);
   
-  res.json({ 
-    success: true, 
-    message: 'PayCrypt Price API - Long Cache Strategy!',
-    margin: `+${MARGIN_NGN} NGN`,
-    cache_age_seconds: cacheAge,
-    cache_age_hours: Math.floor(cacheAge / 3600),
-    time_since_last_coingecko_call: timeSinceLastRequest,
-    cached_tokens: Object.keys(priceCache),
-    cache_status: Object.keys(priceCache).length > 0 ? 'has_data' : 'empty',
-    total_coingecko_requests: requestCount,
-    next_refresh_in_minutes: Math.max(0, Math.floor((MIN_REQUEST_INTERVAL - (Date.now() - lastRequestTime)) / 60000))
+  db.get('SELECT COUNT(*) as count FROM price_cache', (err, row) => {
+    res.json({ 
+      success: true, 
+      message: 'PayCrypt Price API - Database + Cache Strategy!',
+      margin: `+${MARGIN_NGN} NGN`,
+      cache_age_seconds: cacheAge,
+      cache_age_hours: Math.floor(cacheAge / 3600),
+      time_since_last_coingecko_call: timeSinceLastRequest,
+      memory_cached_tokens: Object.keys(memoryCache),
+      database_token_count: row ? row.count : 0,
+      cache_status: Object.keys(memoryCache).length > 0 ? 'has_data' : 'empty',
+      total_coingecko_requests: requestCount,
+      next_refresh_in_minutes: Math.max(0, Math.floor((MIN_REQUEST_INTERVAL - (Date.now() - lastRequestTime)) / 60000)),
+      database_enabled: true
+    });
   });
 });
 
-// CoinGecko-compatible endpoint with MAXIMUM cache duration
+// Enhanced price endpoint with database fallback
 app.get('/api/v3/simple/price', async (req, res) => {
+  const startTime = Date.now();
+  
   try {
     const { ids, vs_currencies } = req.query;
     
@@ -65,60 +194,75 @@ app.get('/api/v3/simple/price', async (req, res) => {
     const requestedTokens = ids.split(',').map(id => id.trim());
     
     console.log(`📊 Request for: ${requestedTokens.join(', ')}`);
-    console.log(`⏰ Cache age: ${Math.floor(cacheAge/60000)} minutes | Time since last fetch: ${Math.floor(timeSinceLastRequest/60000)} minutes`);
+    console.log(`⏰ Memory cache age: ${Math.floor(cacheAge/60000)} minutes | Time since last fetch: ${Math.floor(timeSinceLastRequest/60000)} minutes`);
     
-    // PRIORITY 1: Serve from cache if we have data (even if old)
-    if (priceCache && Object.keys(priceCache).length > 0) {
+    // PRIORITY 1: Serve from memory cache if fresh
+    if (memoryCache && Object.keys(memoryCache).length > 0 && cacheAge < CACHE_DURATION) {
       const filteredResult = {};
       let foundAllTokens = true;
       
       requestedTokens.forEach(tokenId => {
-        if (priceCache[tokenId]) {
-          filteredResult[tokenId] = priceCache[tokenId];
+        if (memoryCache[tokenId]) {
+          filteredResult[tokenId] = memoryCache[tokenId];
         } else {
           foundAllTokens = false;
         }
       });
       
-      // If we have all requested tokens in cache
       if (foundAllTokens && Object.keys(filteredResult).length > 0) {
-        if (cacheAge < CACHE_DURATION) {
-          console.log(`💾 Serving FRESH cache (${Math.floor(cacheAge/60000)} min old)`);
-          return res.json(filteredResult);
-        } else if (cacheAge < STALE_CACHE_DURATION) {
-          console.log(`🕒 Serving STALE cache (${Math.floor(cacheAge/60000)} min old) - avoiding CoinGecko calls`);
-          
-          // Only try to refresh if enough time passed AND we're not rate limited
-          if (timeSinceLastRequest >= MIN_REQUEST_INTERVAL) {
-            console.log(`🔄 Cache is stale but rate limit allows refresh - attempting background fetch`);
-            // Continue to fetch section below, but serve cache first
-          } else {
-            // Rate limited, just serve stale cache
-            console.log(`⏰ Rate limited - serving stale cache for ${Math.floor((MIN_REQUEST_INTERVAL - timeSinceLastRequest)/60000)} more minutes`);
-            return res.json(filteredResult);
-          }
-        } else {
-          console.log(`🚨 Cache is VERY old (${Math.floor(cacheAge/3600000)} hours) - will try to refresh`);
-        }
-      }
-      
-      // If we have partial data, serve it while potentially fetching missing tokens
-      if (Object.keys(filteredResult).length > 0 && timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
-        console.log(`📦 Serving partial cache data due to rate limits`);
+        console.log(`💾 Serving FRESH memory cache (${Math.floor(cacheAge/60000)} min old)`);
+        logApiCall('/api/v3/simple/price', 'memory_cache_hit', Date.now() - startTime, requestedTokens.join(','));
         return res.json(filteredResult);
       }
     }
     
-    // PRIORITY 2: Only fetch from CoinGecko if absolutely necessary
-    if (timeSinceLastRequest >= MIN_REQUEST_INTERVAL || Object.keys(priceCache).length === 0) {
+    // PRIORITY 2: Load from database if memory cache is stale/incomplete
+    try {
+      console.log('🗄️ Checking database for cached data...');
+      const dbData = await loadFromDatabase(requestedTokens);
+      
+      if (Object.keys(dbData).length > 0) {
+        // Update memory cache with database data
+        memoryCache = { ...memoryCache, ...dbData };
+        
+        const filteredResult = {};
+        let foundAllTokens = true;
+        
+        requestedTokens.forEach(tokenId => {
+          if (dbData[tokenId]) {
+            filteredResult[tokenId] = dbData[tokenId];
+          } else {
+            foundAllTokens = false;
+          }
+        });
+        
+        if (foundAllTokens && cacheAge < STALE_CACHE_DURATION) {
+          console.log(`🗄️ Serving from DATABASE (${Object.keys(filteredResult).length} tokens found)`);
+          logApiCall('/api/v3/simple/price', 'database_hit', Date.now() - startTime, requestedTokens.join(','));
+          return res.json(filteredResult);
+        }
+        
+        // If we have partial data and rate limited, serve what we have
+        if (Object.keys(filteredResult).length > 0 && timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+          console.log(`🗄️ Serving partial DATABASE data due to rate limits`);
+          logApiCall('/api/v3/simple/price', 'database_partial', Date.now() - startTime, requestedTokens.join(','));
+          return res.json(filteredResult);
+        }
+      }
+    } catch (dbError) {
+      console.error('❌ Database error:', dbError.message);
+    }
+    
+    // PRIORITY 3: Fetch from CoinGecko if allowed
+    if (timeSinceLastRequest >= MIN_REQUEST_INTERVAL || Object.keys(memoryCache).length === 0) {
       console.log(`🔄 Attempting CoinGecko fetch (Request #${requestCount + 1})`);
       
       try {
         lastRequestTime = now;
         requestCount++;
         
-        // Longer delay to be nice to CoinGecko
-        await new Promise(resolve => setTimeout(resolve, 8000)); // 8 seconds
+        // Even longer delay to avoid rate limits
+        await new Promise(resolve => setTimeout(resolve, 10000)); // 10 seconds
         
         const coinGeckoUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=${vs_currencies}`;
         
@@ -129,10 +273,7 @@ app.get('/api/v3/simple/price', async (req, res) => {
             'Accept': 'application/json',
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
-            'Cache-Control': 'no-cache',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'cross-site'
+            'Cache-Control': 'no-cache'
           }
         });
         
@@ -149,73 +290,87 @@ app.get('/api/v3/simple/price', async (req, res) => {
             };
           });
           
-          // Update cache with fresh data
-          priceCache = { ...priceCache, ...modifiedData };
+          // Update both memory cache and database
+          memoryCache = { ...memoryCache, ...modifiedData };
           lastUpdate = now;
           
-          console.log(`✅ SUCCESS! Fresh data cached for 1 HOUR (Request #${requestCount})`);
+          // Save to database
+          await saveToDatabase(modifiedData);
+          
+          console.log(`✅ SUCCESS! Fresh data cached in memory + database (Request #${requestCount})`);
           console.log('💰 NGN prices with +20 margin:', 
             Object.fromEntries(Object.entries(modifiedData).map(([token, prices]) => [token, prices.ngn]))
           );
           
+          logApiCall('/api/v3/simple/price', 'coingecko_success', Date.now() - startTime, requestedTokens.join(','));
           return res.json(modifiedData);
         }
       } catch (fetchError) {
         console.error(`❌ CoinGecko error (Request #${requestCount}): ${fetchError.message}`);
+        logApiCall('/api/v3/simple/price', 'coingecko_error', Date.now() - startTime, fetchError.message);
         
         // Reset request time to allow retry sooner on failure
-        lastRequestTime = lastRequestTime - (MIN_REQUEST_INTERVAL * 0.5);
-        
-        // Fall through to serve cache or defaults
+        lastRequestTime = lastRequestTime - (MIN_REQUEST_INTERVAL * 0.3);
       }
     } else {
       const waitMinutes = Math.floor((MIN_REQUEST_INTERVAL - timeSinceLastRequest) / 60000);
       console.log(`⏰ RATE LIMITED - ${waitMinutes} minutes until next CoinGecko call allowed`);
     }
     
-    // PRIORITY 3: Serve ANY available cache (even very stale)
-    if (Object.keys(priceCache).length > 0) {
-      console.log(`🆘 Serving EMERGENCY cache (${Math.floor(cacheAge/60000)} min old)`);
-      
-      const filteredResult = {};
+    // PRIORITY 4: Serve ANY available data (memory or database)
+    let availableData = {};
+    
+    // Try memory first
+    if (Object.keys(memoryCache).length > 0) {
       requestedTokens.forEach(tokenId => {
-        if (priceCache[tokenId]) {
-          filteredResult[tokenId] = priceCache[tokenId];
+        if (memoryCache[tokenId]) {
+          availableData[tokenId] = memoryCache[tokenId];
         }
       });
-      
-      if (Object.keys(filteredResult).length > 0) {
-        return res.json(filteredResult);
-      }
-      
-      // Return all cache if no specific matches
-      return res.json(priceCache);
     }
     
-    // PRIORITY 4: Only use defaults if absolutely no cache exists
-    console.log('⚠️ NO CACHE - Emergency defaults (avoid this!)');
+    // Try database if memory doesn't have everything
+    if (Object.keys(availableData).length < requestedTokens.length) {
+      try {
+        const dbData = await loadFromDatabase(requestedTokens);
+        availableData = { ...availableData, ...dbData };
+      } catch (dbError) {
+        console.error('❌ Database fallback error:', dbError.message);
+      }
+    }
+    
+    if (Object.keys(availableData).length > 0) {
+      console.log(`🆘 Serving STALE data (${Object.keys(availableData).length} tokens)`);
+      logApiCall('/api/v3/simple/price', 'stale_data', Date.now() - startTime, Object.keys(availableData).join(','));
+      return res.json(availableData);
+    }
+    
+    // PRIORITY 5: Emergency defaults (last resort)
+    console.log('⚠️ NO DATA AVAILABLE - Emergency defaults');
     const defaultResult = {};
     
     requestedTokens.forEach(tokenId => {
       if (tokenId === 'tether' || tokenId === 'usd-coin') {
         defaultResult[tokenId] = {
           usd: 1.00,
-          ngn: 1650 + MARGIN_NGN
+          ngn: 1520 + MARGIN_NGN
         };
       } else if (tokenId === 'ethereum') {
         defaultResult[tokenId] = {
           usd: 3200,
-          ngn: (3200 * 1650) + MARGIN_NGN
+          ngn: (3200 * 1520) + MARGIN_NGN
         };
       }
     });
     
     if (Object.keys(defaultResult).length > 0) {
-      console.log('🚨 Serving emergency defaults - cache was empty!');
+      console.log('🚨 Serving emergency defaults');
+      logApiCall('/api/v3/simple/price', 'emergency_defaults', Date.now() - startTime, requestedTokens.join(','));
       return res.json(defaultResult);
     }
     
     // Last resort
+    logApiCall('/api/v3/simple/price', 'service_unavailable', Date.now() - startTime, requestedTokens.join(','));
     res.status(503).json({
       error: 'Service temporarily unavailable',
       message: `No price data available. Next CoinGecko retry in ${Math.floor((MIN_REQUEST_INTERVAL - (now - lastRequestTime)) / 60000)} minutes.`,
@@ -224,11 +379,17 @@ app.get('/api/v3/simple/price', async (req, res) => {
     
   } catch (error) {
     console.error('❌ Unexpected error:', error.message);
+    logApiCall('/api/v3/simple/price', 'unexpected_error', Date.now() - startTime, error.message);
     
-    // Always try to serve cache on errors
-    if (Object.keys(priceCache).length > 0) {
-      console.log('🆘 Error fallback - serving cache');
-      return res.json(priceCache);
+    // Try to serve any available data on errors
+    try {
+      const dbData = await loadFromDatabase();
+      if (Object.keys(dbData).length > 0) {
+        console.log('🆘 Error fallback - serving database data');
+        return res.json(dbData);
+      }
+    } catch (dbError) {
+      console.error('❌ Database fallback failed:', dbError.message);
     }
     
     res.status(500).json({
@@ -238,71 +399,81 @@ app.get('/api/v3/simple/price', async (req, res) => {
   }
 });
 
+// Database management endpoints
+app.get('/database/stats', (req, res) => {
+  db.all(`SELECT 
+    token_id, 
+    usd_price, 
+    ngn_price, 
+    datetime(last_updated/1000, 'unixepoch') as last_updated_human,
+    (strftime('%s', 'now') * 1000 - last_updated) / 60000 as age_minutes
+    FROM price_cache 
+    ORDER BY last_updated DESC`, (err, rows) => {
+    if (err) {
+      return res.status(500).json({ error: err.message });
+    }
+    
+    res.json({
+      total_tokens: rows.length,
+      tokens: rows,
+      memory_cache_count: Object.keys(memoryCache).length
+    });
+  });
+});
+
+app.get('/database/metrics', (req, res) => {
+  db.all(`SELECT 
+    status,
+    COUNT(*) as count,
+    AVG(response_time) as avg_response_time,
+    datetime(MAX(timestamp)/1000, 'unixepoch') as last_occurrence
+    FROM api_metrics 
+    WHERE timestamp > ? 
+    GROUP BY status
+    ORDER BY count DESC`, [Date.now() - 24*60*60*1000], (err, rows) => {
+    if (err) {
+      return res.status(500).json({ error: err.message });
+    }
+    
+    res.json({
+      last_24_hours: rows,
+      total_coingecko_requests: requestCount
+    });
+  });
+});
+
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({
-    name: 'PayCrypt Price API - Long Cache Strategy',
-    description: 'Maximized cache duration to minimize CoinGecko calls',
+    name: 'PayCrypt Price API - Database + Cache Strategy',
+    description: 'Persistent database storage with memory cache for reliability',
     margin: `+${MARGIN_NGN} NGN`,
-    cache_strategy: {
+    features: {
+      database_persistence: true,
+      memory_cache: true,
       fresh_cache_duration: '1 hour',
-      stale_cache_tolerance: '24 hours',
-      min_interval_between_calls: '15 minutes',
+      stale_cache_tolerance: '48 hours',
+      min_interval_between_calls: '20 minutes',
       coingecko_requests_made: requestCount
     },
     usage: '/api/v3/simple/price?ids=tether,ethereum&vs_currencies=ngn,usd'
   });
 });
 
-// Cache management endpoints
-app.get('/cache/info', (req, res) => {
-  const now = Date.now();
-  const cacheAge = now - lastUpdate;
+// Initialize and start server
+async function startServer() {
+  await initializeCache();
   
-  res.json({
-    cache_age_minutes: Math.floor(cacheAge / 60000),
-    cache_age_hours: Math.floor(cacheAge / 3600000),
-    cached_tokens: Object.keys(priceCache),
-    cache_count: Object.keys(priceCache).length,
-    last_update: lastUpdate ? new Date(lastUpdate).toISOString() : 'never',
-    fresh_cache: cacheAge < CACHE_DURATION,
-    stale_but_usable: cacheAge < STALE_CACHE_DURATION,
-    coingecko_requests_made: requestCount,
-    next_refresh_allowed: new Date(lastRequestTime + MIN_REQUEST_INTERVAL).toISOString(),
-    cache_data: priceCache
+  app.listen(PORT, () => {
+    console.log(`🚀 PayCrypt Price API running on port ${PORT}`);
+    console.log(`💰 Adding ${MARGIN_NGN} NGN margin to all prices`);
+    console.log(`🗄️ DATABASE ENABLED: SQLite persistent storage`);
+    console.log(`💾 DUAL CACHE: Memory (speed) + Database (persistence)`);
+    console.log(`⏰ CoinGecko calls limited to every 20 minutes`);
+    console.log(`🎯 Strategy: Database persistence + memory cache for reliability`);
   });
-});
+}
 
-app.get('/cache/force-refresh', async (req, res) => {
-  try {
-    console.log('🔄 Manual cache refresh triggered');
-    
-    // Reset timing to allow immediate fetch
-    lastRequestTime = 0;
-    
-    // Trigger a refresh by making a request
-    const response = await axios.get(`http://localhost:${PORT}/api/v3/simple/price?ids=tether,usd-coin,ethereum&vs_currencies=ngn,usd`);
-    
-    res.json({
-      success: true,
-      message: 'Cache refresh triggered',
-      new_data: response.data
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: 'Refresh failed',
-      message: error.message
-    });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 PayCrypt Price API running on port ${PORT}`);
-  console.log(`💰 Adding ${MARGIN_NGN} NGN margin to all prices`);
-  console.log(`💾 MAXIMIZED CACHE: Fresh for 1 hour, stale tolerance 24 hours`);
-  console.log(`⏰ CoinGecko calls limited to every 15 minutes`);
-  console.log(`🎯 Strategy: Minimize CoinGecko calls, maximize cache usage`);
-});
+startServer().catch(console.error);
 
 module.exports = app;

@@ -1,18 +1,27 @@
 {
   "name": "margin-price-api",
   "version": "1.0.0",
-  "description": "Simple API that adds 10 NGN margin to crypto prices",
+  "description": "PayCrypt Price API with database persistence",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
     "axios": "^1.6.0",
     "cors": "^2.8.5",
-    "node-cache": "^5.1.2"
+    "express": "^4.18.2",
+    "sqlite3": "^5.1.7"
   },
-  "engines": {
-    "node": ">=16.0.0"
-  }
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": [
+    "api",
+    "cryptocurrency",
+    "price",
+    "database"
+  ],
+  "author": "PayCrypt Team",
+  "license": "ISC"
 }
