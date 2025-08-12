@@ -15,6 +15,7 @@ app.use(cors({
     'https://www.paycrypt.org',
     'https://paycrypt.org',
     'http://localhost:5173',
+    'https://miniapp.paycrypt.org',
     'http://localhost:3000'
   ]
 }));
