@@ -27,7 +27,7 @@ const MARGIN_NGN = 20;
 const dbPath = path.join(__dirname, 'price_cache.db');
 const db = new sqlite3.Database(dbPath);
 
-// Initialize database with enhanced schema
+// Initialize database with enhanced schema (FIXED SQLite syntax)
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS price_cache (
     token_id TEXT PRIMARY KEY,
@@ -40,14 +40,17 @@ db.serialize(() => {
     priority INTEGER DEFAULT 0
   )`);
   
-  // Track requested tokens that aren't cached
+  // Track requested tokens that aren't cached (FIXED: removed inline INDEX)
   db.run(`CREATE TABLE IF NOT EXISTS token_requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     token_id TEXT,
     timestamp INTEGER,
-    success BOOLEAN DEFAULT 0,
-    INDEX(token_id, timestamp)
+    success BOOLEAN DEFAULT 0
   )`);
+  
+  // Create indexes separately (FIXED SQLite syntax)
+  db.run(`CREATE INDEX IF NOT EXISTS idx_token_requests_token_time 
+           ON token_requests(token_id, timestamp)`);
   
   db.run(`CREATE TABLE IF NOT EXISTS api_metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -211,7 +214,7 @@ async function backgroundFetchPrices() {
     requestedTokensQueue.clear();
     
     if (tokensToFetch.size === 0) {
-      console.log('📭 No tokens to fetch');
+      console.log('🔭 No tokens to fetch');
       return;
     }
     
