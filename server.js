@@ -75,6 +75,20 @@ const DEFAULT_TOKENS = [
   'cardano', 'solana', 'polygon', 'chainlink', 'avalanche-2'
 ];
 
+// Track requested tokens
+let dynamicTokens = new Set();
+
+// Add token to dynamic tracking
+function trackToken(tokenId) {
+  if (!DEFAULT_TOKENS.includes(tokenId) && !dynamicTokens.has(tokenId)) {
+    dynamicTokens.add(tokenId);
+    // Trigger background fetch for new token if not already fetching
+    if (!isFetching) {
+      setTimeout(() => backgroundFetchPrices(), 100);
+    }
+  }
+}
+
 // Database helper functions
 function saveToDatabase(tokenData) {
   return new Promise((resolve, reject) => {
@@ -178,30 +192,49 @@ async function backgroundFetchPrices() {
   try {
     console.log(`🔄 Background fetch #${fetchAttempts} starting...`);
     
-    const tokenList = DEFAULT_TOKENS.join(',');
-    const coinGeckoUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${tokenList}&vs_currencies=usd,ngn`;
+    // Combine default and dynamic tokens
+    const allTokens = [...DEFAULT_TOKENS, ...Array.from(dynamicTokens)];
+    const tokenList = allTokens.join(',');
     
-    const response = await axios.get(coinGeckoUrl, {
-      timeout: 30000,
-      headers: {
-        'User-Agent': 'PayCrypt-API/1.0',
-        'Accept': 'application/json'
-      }
-    });
+    // Split tokens into chunks of 100 to avoid URL length limits
+    const chunkSize = 100;
+    const tokenChunks = [];
+    for (let i = 0; i < allTokens.length; i += chunkSize) {
+      tokenChunks.push(allTokens.slice(i, i + chunkSize));
+    }
     
-    const originalData = response.data;
+    const modifiedData = {};
     
-    if (originalData && Object.keys(originalData).length > 0) {
-      // Apply margin to NGN prices
-      const modifiedData = {};
+    // Fetch each chunk
+    for (const chunk of tokenChunks) {
+      const chunkList = chunk.join(',');
+      const coinGeckoUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${chunkList}&vs_currencies=usd,ngn`;
       
-      Object.entries(originalData).forEach(([tokenId, prices]) => {
-        modifiedData[tokenId] = {
-          ...prices,
-          ngn: prices.ngn ? prices.ngn + MARGIN_NGN : prices.ngn
-        };
+      const response = await axios.get(coinGeckoUrl, {
+        timeout: 30000,
+        headers: {
+          'User-Agent': 'PayCrypt-API/1.0',
+          'Accept': 'application/json'
+        }
       });
       
+      const chunkData = response.data;
+      
+      if (chunkData && Object.keys(chunkData).length > 0) {
+        // Apply margin to NGN prices for this chunk
+        Object.entries(chunkData).forEach(([tokenId, prices]) => {
+          modifiedData[tokenId] = {
+            ...prices,
+            ngn: prices.ngn ? prices.ngn + MARGIN_NGN : prices.ngn
+          };
+        });
+      }
+      
+      // Small delay between chunks to respect rate limits
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    if (Object.keys(modifiedData).length > 0) {
       // Update both memory cache and database
       memoryCache = { ...memoryCache, ...modifiedData };
       lastSuccessfulFetch = Date.now();
@@ -304,7 +337,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Main price endpoint - ALWAYS serve from cache/database (no waiting)
+// Main price endpoint - update to track new tokens
 app.get('/api/v3/simple/price', async (req, res) => {
   const startTime = Date.now();
   
@@ -316,6 +349,10 @@ app.get('/api/v3/simple/price', async (req, res) => {
     }
     
     const requestedTokens = ids.split(',').map(id => id.trim());
+    
+    // Track any new tokens
+    requestedTokens.forEach(token => trackToken(token));
+    
     console.log(`📊 Request for: ${requestedTokens.join(', ')}`);
     
     // PRIORITY 1: Serve from memory cache (fastest)
