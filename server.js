@@ -72,7 +72,8 @@ const CACHE_STALE_DURATION = 2 * 60 * 60 * 1000; // 2 hours (still usable)
 // Default tokens to always fetch
 const DEFAULT_TOKENS = [
   'bitcoin', 'ethereum', 'tether', 'usd-coin', 'binancecoin', 
-  'cardano', 'solana', 'polygon', 'chainlink', 'send-token-2'
+  'cardano', 'solana', 'polygon', 'chainlink', 'send-token-2',
+  'celo-dollar', 'celo'
 ];
 
 // Database helper functions
