@@ -64,11 +64,17 @@ let lastSuccessfulFetch = 0;
 let isFetching = false;
 let fetchAttempts = 0;
 let serverStartTime = Date.now();
+let lastRequestTime = 0;
+let consecutiveFailures = 0;
+let rateLimitedUntil = 0;
 
 // Configuration
 const BACKGROUND_FETCH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 const CACHE_FRESH_DURATION = 10 * 60 * 1000; // 10 minutes (consider fresh)
 const CACHE_STALE_DURATION = 2 * 60 * 60 * 1000; // 2 hours (still usable)
+const MIN_REQUEST_INTERVAL = 65 * 1000; // Minimum 65 seconds between CoinGecko requests
+const MAX_RETRIES = 3;
+const INITIAL_RETRY_DELAY = 10 * 1000; // 10 seconds
 
 // Default tokens to always fetch
 const DEFAULT_TOKENS = [
@@ -166,10 +172,26 @@ function logApiCall(endpoint, status, responseTime, tokensRequested) {
   stmt.finalize();
 }
 
-// Background fetch function
-async function backgroundFetchPrices() {
+// Background fetch function with rate limiting and exponential backoff
+async function backgroundFetchPrices(retryCount = 0) {
   if (isFetching) {
     console.log('⏳ Background fetch already in progress, skipping...');
+    return;
+  }
+
+  // Check if we're rate limited
+  const now = Date.now();
+  if (now < rateLimitedUntil) {
+    const waitMinutes = Math.ceil((rateLimitedUntil - now) / 60000);
+    console.log(`⏸️ Rate limited. Waiting ${waitMinutes} more minute(s)...`);
+    return;
+  }
+
+  // Enforce minimum time between requests
+  const timeSinceLastRequest = now - lastRequestTime;
+  if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+    const waitSeconds = Math.ceil((MIN_REQUEST_INTERVAL - timeSinceLastRequest) / 1000);
+    console.log(`⏸️ Throttling: waiting ${waitSeconds}s before next request...`);
     return;
   }
 
@@ -180,6 +202,7 @@ async function backgroundFetchPrices() {
   try {
     console.log(`🔄 Background fetch #${fetchAttempts} starting...`);
     
+    lastRequestTime = Date.now();
     const tokenList = DEFAULT_TOKENS.join(',');
     const coinGeckoUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${tokenList}&vs_currencies=usd,ngn`;
     
@@ -207,6 +230,7 @@ async function backgroundFetchPrices() {
       // Update both memory cache and database
       memoryCache = { ...memoryCache, ...modifiedData };
       lastSuccessfulFetch = Date.now();
+      consecutiveFailures = 0; // Reset failure counter on success
       
       // Save to database
       await saveToDatabase(modifiedData);
@@ -222,8 +246,29 @@ async function backgroundFetchPrices() {
     
   } catch (error) {
     const responseTime = Date.now() - startTime;
-    console.error(`❌ Background fetch FAILED (attempt #${fetchAttempts}):`, error.message);
-    logFetchAttempt('error', 0, error.message, responseTime);
+    const isRateLimit = error.response && error.response.status === 429;
+    
+    if (isRateLimit) {
+      consecutiveFailures++;
+      // Exponential backoff: 5min, 10min, 30min, 60min
+      const backoffMinutes = Math.min(5 * Math.pow(2, consecutiveFailures - 1), 60);
+      rateLimitedUntil = Date.now() + (backoffMinutes * 60 * 1000);
+      
+      console.error(`🚫 RATE LIMITED (429) - Backing off for ${backoffMinutes} minutes`);
+      console.log(`⏰ Next fetch attempt after: ${new Date(rateLimitedUntil).toISOString()}`);
+      
+      logFetchAttempt('rate_limited', 0, `Rate limited - backoff ${backoffMinutes}min`, responseTime);
+    } else {
+      console.error(`❌ Background fetch FAILED (attempt #${fetchAttempts}):`, error.message);
+      logFetchAttempt('error', 0, error.message, responseTime);
+      
+      // Retry for non-rate-limit errors
+      if (retryCount < MAX_RETRIES) {
+        const retryDelay = INITIAL_RETRY_DELAY * Math.pow(2, retryCount);
+        console.log(`🔄 Retrying in ${retryDelay/1000}s... (attempt ${retryCount + 1}/${MAX_RETRIES})`);
+        setTimeout(() => backgroundFetchPrices(retryCount + 1), retryDelay);
+      }
+    }
     
     // Don't reset lastSuccessfulFetch - keep serving cached data
   } finally {
@@ -283,6 +328,7 @@ app.get('/health', (req, res) => {
   const now = Date.now();
   const cacheAge = Math.floor((now - lastSuccessfulFetch) / 1000);
   const uptimeSeconds = Math.floor((now - serverStartTime) / 1000);
+  const isRateLimited = now < rateLimitedUntil;
   
   db.get('SELECT COUNT(*) as count FROM price_cache', (err, row) => {
     res.json({ 
@@ -298,8 +344,12 @@ app.get('/health', (req, res) => {
       database_token_count: row ? row.count : 0,
       cache_status: Object.keys(memoryCache).length > 0 ? 'has_data' : 'empty',
       is_fetching: isFetching,
+      is_rate_limited: isRateLimited,
+      rate_limit_expires: isRateLimited ? new Date(rateLimitedUntil).toISOString() : null,
+      consecutive_failures: consecutiveFailures,
       total_fetch_attempts: fetchAttempts,
       background_fetch_interval_minutes: BACKGROUND_FETCH_INTERVAL / 60000,
+      min_request_interval_seconds: MIN_REQUEST_INTERVAL / 1000,
       cache_fresh_threshold_minutes: CACHE_FRESH_DURATION / 60000,
       database_enabled: true
     });
