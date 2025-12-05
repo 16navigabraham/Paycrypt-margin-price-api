@@ -223,32 +223,41 @@ async function fetchPricesFromAlchemy(tokenIds) {
     // Transform Alchemy response to match CoinGecko format
     const transformedData = {};
     
-    // Handle different possible response structures
+    // Alchemy returns { data: [ { symbol, prices: [{ value, currency }] } ] }
     let tokenDataArray = [];
-    if (response.data && Array.isArray(response.data)) {
-      tokenDataArray = response.data;
-    } else if (response.data && response.data.data && Array.isArray(response.data.data)) {
+    if (response.data && response.data.data && Array.isArray(response.data.data)) {
       tokenDataArray = response.data.data;
+      console.log(`🔷 Response structure: data array with ${tokenDataArray.length} items`);
+      console.log(`🔷 First item:`, JSON.stringify(tokenDataArray[0]).substring(0, 300));
+    } else if (Array.isArray(response.data)) {
+      tokenDataArray = response.data;
     }
 
-    console.log(`🔷 Found ${tokenDataArray.length} tokens in Alchemy response`);
+    console.log(`🔷 Processing ${tokenDataArray.length} tokens from Alchemy response`);
 
-    tokenDataArray.forEach(tokenData => {
+    tokenDataArray.forEach((tokenData, index) => {
+      console.log(`🔷 Token ${index}:`, JSON.stringify(tokenData).substring(0, 200));
+      
       // Find the token ID from symbol
       const tokenId = Object.keys(TOKEN_SYMBOL_MAP).find(
         key => TOKEN_SYMBOL_MAP[key] === tokenData.symbol
       );
       
       if (tokenId) {
-        // Handle different price response formats
         let usdPrice = null;
         
-        if (tokenData.prices && Array.isArray(tokenData.prices) && tokenData.prices.length > 0) {
-          usdPrice = tokenData.prices[0].value || tokenData.prices[0];
+        // Alchemy format: prices array with {value, currency} objects
+        if (tokenData.prices && Array.isArray(tokenData.prices)) {
+          // Find USD price
+          const usdPriceObj = tokenData.prices.find(p => p.currency === 'USD' || p.currency === 'usd');
+          if (usdPriceObj && usdPriceObj.value) {
+            usdPrice = usdPriceObj.value;
+          } else if (tokenData.prices.length > 0 && tokenData.prices[0].value) {
+            // Fallback to first price if no USD found
+            usdPrice = tokenData.prices[0].value;
+          }
         } else if (tokenData.price) {
           usdPrice = tokenData.price;
-        } else if (tokenData.priceUsd) {
-          usdPrice = tokenData.priceUsd;
         }
         
         if (usdPrice) {
@@ -256,8 +265,12 @@ async function fetchPricesFromAlchemy(tokenIds) {
             usd: parseFloat(usdPrice),
             ngn: null
           };
-          console.log(`🔷 ${tokenId} (${tokenData.symbol}): $${usdPrice}`);
+          console.log(`✅ ${tokenId} (${tokenData.symbol}): $${usdPrice}`);
+        } else {
+          console.log(`⚠️ ${tokenData.symbol}: No price found`);
         }
+      } else {
+        console.log(`⚠️ Unknown symbol: ${tokenData.symbol}`);
       }
     });
 
