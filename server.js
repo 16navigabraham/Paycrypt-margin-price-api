@@ -209,34 +209,68 @@ async function fetchPricesFromAlchemy(tokenIds) {
   const symbolsParam = symbols.join(',');
   const url = `https://api.g.alchemy.com/prices/v1/${ALCHEMY_API_KEY}/tokens/by-symbol?symbols=${symbolsParam}`;
   
-  const response = await axios.get(url, {
-    timeout: 30000,
-    headers: {
-      'Accept': 'application/json'
-    }
-  });
+  try {
+    const response = await axios.get(url, {
+      timeout: 30000,
+      headers: {
+        'Accept': 'application/json'
+      }
+    });
 
-  // Transform Alchemy response to match CoinGecko format
-  const transformedData = {};
-  if (response.data && response.data.data) {
-    response.data.data.forEach(tokenData => {
+    console.log(`🔷 Alchemy response status: ${response.status}`);
+    console.log(`🔷 Alchemy response keys:`, Object.keys(response.data));
+
+    // Transform Alchemy response to match CoinGecko format
+    const transformedData = {};
+    
+    // Handle different possible response structures
+    let tokenDataArray = [];
+    if (response.data && Array.isArray(response.data)) {
+      tokenDataArray = response.data;
+    } else if (response.data && response.data.data && Array.isArray(response.data.data)) {
+      tokenDataArray = response.data.data;
+    }
+
+    console.log(`🔷 Found ${tokenDataArray.length} tokens in Alchemy response`);
+
+    tokenDataArray.forEach(tokenData => {
       // Find the token ID from symbol
       const tokenId = Object.keys(TOKEN_SYMBOL_MAP).find(
         key => TOKEN_SYMBOL_MAP[key] === tokenData.symbol
       );
       
-      if (tokenId && tokenData.prices && tokenData.prices.length > 0) {
-        const usdPrice = tokenData.prices[0].value;
-        transformedData[tokenId] = {
-          usd: usdPrice,
-          ngn: null // Will calculate from USD
-        };
+      if (tokenId) {
+        // Handle different price response formats
+        let usdPrice = null;
+        
+        if (tokenData.prices && Array.isArray(tokenData.prices) && tokenData.prices.length > 0) {
+          usdPrice = tokenData.prices[0].value || tokenData.prices[0];
+        } else if (tokenData.price) {
+          usdPrice = tokenData.price;
+        } else if (tokenData.priceUsd) {
+          usdPrice = tokenData.priceUsd;
+        }
+        
+        if (usdPrice) {
+          transformedData[tokenId] = {
+            usd: parseFloat(usdPrice),
+            ngn: null
+          };
+          console.log(`🔷 ${tokenId} (${tokenData.symbol}): $${usdPrice}`);
+        }
       }
     });
-  }
 
-  console.log(`🔷 Alchemy returned ${Object.keys(transformedData).length} token prices`);
-  return transformedData;
+    console.log(`🔷 Alchemy returned ${Object.keys(transformedData).length} token prices`);
+    return transformedData;
+  } catch (error) {
+    console.error(`🔷 Alchemy API Error: ${error.message}`);
+    if (error.response) {
+      console.error(`🔷 Status: ${error.response.status}`);
+      console.error(`🔷 Response keys:`, Object.keys(error.response.data || {}));
+    }
+    throw error;
+  }
 }
 
 // Get NGN exchange rate and calculate NGN prices
