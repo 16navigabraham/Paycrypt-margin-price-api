@@ -85,6 +85,7 @@ const DEFAULT_TOKENS = [
 ];
 
 // Token symbol mapping for Alchemy API (CoinGecko ID -> Symbol)
+// For Base mainnet tokens, we use contract addresses
 const TOKEN_SYMBOL_MAP = {
   'bitcoin': 'BTC',
   'ethereum': 'ETH',
@@ -95,9 +96,16 @@ const TOKEN_SYMBOL_MAP = {
   'solana': 'SOL',
   'polygon': 'MATIC',
   'chainlink': 'LINK',
-  'send-token-2': 'SEND',
+  'send-token-2': 'SEND',  // SEND token on Base
   'celo-dollar': 'CUSD',
   'celo': 'CELO'
+};
+
+// Base mainnet contract addresses for tokens
+const BASE_MAINNET_ADDRESSES = {
+  'SEND': '0xeab49138ba2ea6dd776220fe26b7b8e446638956',
+  'USDC': '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+  'USDT': '0xfde4c96c8593536e31f229ea8f37b2ada2699bb2'
 };
 
 // Database helper functions
@@ -282,6 +290,37 @@ async function fetchPricesFromAlchemy(tokenIds) {
     });
 
     console.log(`🔷 Alchemy returned ${Object.keys(transformedData).length} token prices`);
+    
+    // If we're missing SEND, try fetching it by contract address
+    if (!transformedData['send-token-2'] && BASE_MAINNET_ADDRESSES['SEND']) {
+      console.log(`🔷 SEND not found by symbol, trying by contract address...`);
+      try {
+        const contractAddr = BASE_MAINNET_ADDRESSES['SEND'];
+        const contractResponse = await axios.post(
+          `https://api.g.alchemy.com/prices/v1/${ALCHEMY_API_KEY}/tokens/by-address?chainId=8453&addresses=${contractAddr}`,
+          {},
+          {
+            timeout: 30000,
+            headers: { 'Accept': 'application/json' }
+          }
+        );
+        
+        if (contractResponse.data && contractResponse.data.data && contractResponse.data.data.length > 0) {
+          const sendData = contractResponse.data.data[0];
+          if (sendData.prices && sendData.prices.length > 0) {
+            const usdPrice = sendData.prices[0].value;
+            transformedData['send-token-2'] = {
+              usd: parseFloat(usdPrice),
+              ngn: null
+            };
+            console.log(`✅ send-token-2 (SEND): $${usdPrice} [via contract address]`);
+          }
+        }
+      } catch (contractError) {
+        console.log(`⚠️ Contract address lookup failed: ${contractError.message}`);
+      }
+    }
+    
     return transformedData;
   } catch (error) {
     console.error(`🔷 Alchemy API Error: ${error.message}`);
