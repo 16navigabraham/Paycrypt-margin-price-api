@@ -6,6 +6,7 @@ const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY || '';
 
 // CORS configuration (unchanged)
 app.use(cors({
@@ -82,6 +83,22 @@ const DEFAULT_TOKENS = [
   'cardano', 'solana', 'polygon', 'chainlink', 'send-token-2',
   'celo-dollar', 'celo'
 ];
+
+// Token symbol mapping for Alchemy API (CoinGecko ID -> Symbol)
+const TOKEN_SYMBOL_MAP = {
+  'bitcoin': 'BTC',
+  'ethereum': 'ETH',
+  'tether': 'USDT',
+  'usd-coin': 'USDC',
+  'binancecoin': 'BNB',
+  'cardano': 'ADA',
+  'solana': 'SOL',
+  'polygon': 'MATIC',
+  'chainlink': 'LINK',
+  'send-token-2': 'SEND',
+  'celo-dollar': 'CUSD',
+  'celo': 'CELO'
+};
 
 // Database helper functions
 function saveToDatabase(tokenData) {
@@ -172,6 +189,83 @@ function logApiCall(endpoint, status, responseTime, tokensRequested) {
   stmt.finalize();
 }
 
+// Alchemy price fetching function
+async function fetchPricesFromAlchemy(tokenIds) {
+  if (!ALCHEMY_API_KEY) {
+    throw new Error('Alchemy API key not configured');
+  }
+
+  const symbols = tokenIds
+    .map(id => TOKEN_SYMBOL_MAP[id])
+    .filter(symbol => symbol); // Filter out unmapped tokens
+
+  if (symbols.length === 0) {
+    throw new Error('No valid token symbols for Alchemy');
+  }
+
+  const url = `https://api.g.alchemy.com/prices/v1/${ALCHEMY_API_KEY}/tokens/by-symbol`;
+  
+  const response = await axios.post(url, {
+    symbols: symbols
+  }, {
+    timeout: 30000,
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json'
+    }
+  });
+
+  // Transform Alchemy response to match CoinGecko format
+  const transformedData = {};
+  if (response.data && response.data.data) {
+    response.data.data.forEach(tokenData => {
+      // Find the token ID from symbol
+      const tokenId = Object.keys(TOKEN_SYMBOL_MAP).find(
+        key => TOKEN_SYMBOL_MAP[key] === tokenData.symbol
+      );
+      
+      if (tokenId && tokenData.prices && tokenData.prices.length > 0) {
+        const usdPrice = tokenData.prices[0].value;
+        transformedData[tokenId] = {
+          usd: usdPrice,
+          ngn: null // Will calculate from USD
+        };
+      }
+    });
+  }
+
+  return transformedData;
+}
+
+// Get NGN exchange rate and calculate NGN prices
+async function calculateNGNPrices(tokenData) {
+  try {
+    // Fetch USD to NGN rate from CoinGecko or use fallback
+    const response = await axios.get(
+      'https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=ngn',
+      { timeout: 10000 }
+    );
+    
+    const usdToNgn = response.data?.tether?.ngn || 1520; // Fallback rate
+    
+    Object.keys(tokenData).forEach(tokenId => {
+      if (tokenData[tokenId].usd && !tokenData[tokenId].ngn) {
+        tokenData[tokenId].ngn = tokenData[tokenId].usd * usdToNgn;
+      }
+    });
+  } catch (error) {
+    console.warn('⚠️ Failed to fetch NGN rate, using fallback: 1520');
+    // Use fallback NGN rate
+    Object.keys(tokenData).forEach(tokenId => {
+      if (tokenData[tokenId].usd && !tokenData[tokenId].ngn) {
+        tokenData[tokenId].ngn = tokenData[tokenId].usd * 1520;
+      }
+    });
+  }
+  
+  return tokenData;
+}
+
 // Background fetch function with rate limiting and exponential backoff
 async function backgroundFetchPrices(retryCount = 0) {
   if (isFetching) {
@@ -203,18 +297,45 @@ async function backgroundFetchPrices(retryCount = 0) {
     console.log(`🔄 Background fetch #${fetchAttempts} starting...`);
     
     lastRequestTime = Date.now();
-    const tokenList = DEFAULT_TOKENS.join(',');
-    const coinGeckoUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${tokenList}&vs_currencies=usd,ngn`;
+    let originalData = {};
+    let source = 'coingecko';
     
-    const response = await axios.get(coinGeckoUrl, {
-      timeout: 30000,
-      headers: {
-        'User-Agent': 'PayCrypt-API/1.0',
-        'Accept': 'application/json'
+    // Try CoinGecko first
+    try {
+      const tokenList = DEFAULT_TOKENS.join(',');
+      const coinGeckoUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${tokenList}&vs_currencies=usd,ngn`;
+      
+      const response = await axios.get(coinGeckoUrl, {
+        timeout: 30000,
+        headers: {
+          'User-Agent': 'PayCrypt-API/1.0',
+          'Accept': 'application/json'
+        }
+      });
+      
+      originalData = response.data;
+      console.log('✅ Fetched from CoinGecko');
+    } catch (coinGeckoError) {
+      const isCoinGeckoRateLimit = coinGeckoError.response && coinGeckoError.response.status === 429;
+      
+      if (isCoinGeckoRateLimit && ALCHEMY_API_KEY) {
+        console.log('⚠️ CoinGecko rate limited, trying Alchemy...');
+        
+        // Try Alchemy as fallback
+        try {
+          originalData = await fetchPricesFromAlchemy(DEFAULT_TOKENS);
+          // Calculate NGN prices from USD
+          originalData = await calculateNGNPrices(originalData);
+          source = 'alchemy';
+          console.log('✅ Fetched from Alchemy');
+        } catch (alchemyError) {
+          console.error('❌ Alchemy fetch failed:', alchemyError.message);
+          throw coinGeckoError; // Throw original CoinGecko error
+        }
+      } else {
+        throw coinGeckoError; // Re-throw if not rate limit or no Alchemy key
       }
-    });
-    
-    const originalData = response.data;
+    }
     
     if (originalData && Object.keys(originalData).length > 0) {
       // Apply margin to NGN prices
@@ -236,9 +357,9 @@ async function backgroundFetchPrices(retryCount = 0) {
       await saveToDatabase(modifiedData);
       
       const responseTime = Date.now() - startTime;
-      console.log(`✅ Background fetch SUCCESS! Updated ${Object.keys(modifiedData).length} tokens (${responseTime}ms)`);
+      console.log(`✅ Background fetch SUCCESS! Updated ${Object.keys(modifiedData).length} tokens from ${source} (${responseTime}ms)`);
       
-      logFetchAttempt('success', Object.keys(modifiedData).length, null, responseTime);
+      logFetchAttempt('success', Object.keys(modifiedData).length, `source: ${source}`, responseTime);
       
     } else {
       throw new Error('Empty response from CoinGecko');
