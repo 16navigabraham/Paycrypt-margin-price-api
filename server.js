@@ -313,8 +313,11 @@ async function fetchPricesFromAlchemy(tokenIds) {
       console.log(`🔷 SEND not found by symbol, trying by contract address...`);
       try {
         const contractAddr = BASE_MAINNET_ADDRESSES['SEND'];
+        const addressParams = new URLSearchParams();
+        addressParams.append('addresses', contractAddr);
+        
         const contractResponse = await axios.post(
-          `https://api.g.alchemy.com/prices/v1/${ALCHEMY_API_KEY}/tokens/by-address?chainId=8453&addresses=${contractAddr}`,
+          `https://api.g.alchemy.com/prices/v1/${ALCHEMY_API_KEY}/tokens/by-address?chainId=8453&${addressParams.toString()}`,
           {},
           {
             timeout: 30000,
@@ -357,13 +360,29 @@ async function fetchPricesFromAlchemy(tokenIds) {
 // Get NGN exchange rate and calculate NGN prices
 async function calculateNGNPrices(tokenData) {
   try {
-    // Fetch USD to NGN rate from CoinGecko or use fallback
+    // Try CoinMarketCap first for NGN rate if available
+    if (COINMARKETCAP_API_KEY) {
+      const cmcRate = await getNGNRateFromCoinMarketCap();
+      if (cmcRate) {
+        Object.keys(tokenData).forEach(tokenId => {
+          if (tokenData[tokenId].usd && !tokenData[tokenId].ngn) {
+            tokenData[tokenId].ngn = tokenData[tokenId].usd * cmcRate;
+          }
+        });
+        console.log(`✅ NGN prices calculated using CoinMarketCap rate: ${cmcRate}`);
+        return tokenData;
+      }
+    }
+    
+    // Fall back to CoinGecko for NGN rate
+    console.log('📡 Fetching NGN rate from CoinGecko...');
     const response = await axios.get(
       'https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=ngn',
       { timeout: 10000 }
     );
     
     const usdToNgn = response.data?.tether?.ngn || 1520; // Fallback rate
+    console.log(`✅ NGN rate from CoinGecko: ${usdToNgn}`);
     
     Object.keys(tokenData).forEach(tokenId => {
       if (tokenData[tokenId].usd && !tokenData[tokenId].ngn) {
@@ -371,7 +390,7 @@ async function calculateNGNPrices(tokenData) {
       }
     });
   } catch (error) {
-    console.warn('⚠️ Failed to fetch NGN rate, using fallback: 1520');
+    console.warn('⚠️ Failed to fetch NGN rate (both CoinMarketCap and CoinGecko), using fallback: 1520');
     // Use fallback NGN rate
     Object.keys(tokenData).forEach(tokenId => {
       if (tokenData[tokenId].usd && !tokenData[tokenId].ngn) {
