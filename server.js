@@ -70,6 +70,11 @@ let lastRequestTime = 0;
 let consecutiveFailures = 0;
 let rateLimitedUntil = 0;
 
+// NGN Rate caching
+let cachedNGNRate = null;
+let ngnRateCacheTime = 0;
+const NGN_RATE_CACHE_DURATION = 30 * 60 * 1000; // 30 minutes
+
 // Configuration
 const BACKGROUND_FETCH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 const CACHE_FRESH_DURATION = 10 * 60 * 1000; // 10 minutes (consider fresh)
@@ -360,46 +365,32 @@ async function fetchPricesFromAlchemy(tokenIds) {
 // Get NGN exchange rate and calculate NGN prices
 async function calculateNGNPrices(tokenData) {
   try {
-    // Try CoinMarketCap first for NGN rate if available
-    if (COINMARKETCAP_API_KEY) {
-      const cmcRate = await getNGNRateFromCoinMarketCap();
-      if (cmcRate) {
-        Object.keys(tokenData).forEach(tokenId => {
-          if (tokenData[tokenId].usd && !tokenData[tokenId].ngn) {
-            tokenData[tokenId].ngn = tokenData[tokenId].usd * cmcRate;
-          }
-        });
-        console.log(`✅ NGN prices calculated using CoinMarketCap rate: ${cmcRate}`);
-        return tokenData;
-      }
-    }
-    
-    // Fall back to CoinGecko for NGN rate
-    console.log('📡 Fetching NGN rate from CoinGecko...');
-    const response = await axios.get(
-      'https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=ngn',
-      { timeout: 10000 }
-    );
-    
-    const usdToNgn = response.data?.tether?.ngn || 1520; // Fallback rate
-    console.log(`✅ NGN rate from CoinGecko: ${usdToNgn}`);
+    // Get NGN rate from cache or fetch fresh
+    const usdToNgn = await getCachedNGNRate();
     
     Object.keys(tokenData).forEach(tokenId => {
       if (tokenData[tokenId].usd && !tokenData[tokenId].ngn) {
         tokenData[tokenId].ngn = tokenData[tokenId].usd * usdToNgn;
       }
     });
+    
+    console.log(`✅ NGN prices calculated using rate: ₦${usdToNgn.toFixed(2)}`);
+    return tokenData;
   } catch (error) {
-    console.warn('⚠️ Failed to fetch NGN rate (both CoinMarketCap and CoinGecko), using fallback: 1520');
-    // Use fallback NGN rate
+    console.error('❌ Failed to calculate NGN prices:', error.message);
+    
+    // Last resort: use fallback rate
+    const fallbackRate = 1520;
+    console.log(`⚠️ Using emergency fallback rate: ₦${fallbackRate}`);
+    
     Object.keys(tokenData).forEach(tokenId => {
       if (tokenData[tokenId].usd && !tokenData[tokenId].ngn) {
-        tokenData[tokenId].ngn = tokenData[tokenId].usd * 1520;
+        tokenData[tokenId].ngn = tokenData[tokenId].usd * fallbackRate;
       }
     });
+    
+    return tokenData;
   }
-  
-  return tokenData;
 }
 
 // Fetch prices from CoinMarketCap API (fallback #3)
@@ -461,33 +452,183 @@ async function fetchPricesFromCoinMarketCap(tokenIds) {
 }
 
 // Get NGN rate from CoinMarketCap (independent source for NGN conversion)
-async function getNGNRateFromCoinMarketCap() {
+async function fetchNGNFromCoinMarketCap() {
   if (!COINMARKETCAP_API_KEY) {
-    return null;
+    throw new Error('CoinMarketCap API key not configured');
   }
+  
+  console.log('💱 Trying CoinMarketCap...');
+  
+  const url = 'https://pro-api.coinmarketcap.com/v1/tools/price-conversion';
+  
+  const response = await axios.get(url, {
+    params: {
+      amount: 1,
+      symbol: 'USD',
+      convert: 'NGN'
+    },
+    headers: {
+      'X-CMC_PRO_API_KEY': COINMARKETCAP_API_KEY,
+      'Accept': 'application/json'
+    },
+    timeout: 10000
+  });
+  
+  console.log('💱 CMC Response:', JSON.stringify(response.data).substring(0, 300));
+  
+  // Try different response paths
+  const rate = response.data?.data?.quote?.NGN?.price || 
+               response.data?.quote?.NGN?.price ||
+               response.data?.data?.quote?.NGN?.value;
+  
+  if (rate && parseFloat(rate) > 0) {
+    return parseFloat(rate);
+  }
+  
+  throw new Error('Invalid response format from CoinMarketCap');
+}
 
-  try {
-    console.log('🔶 Fetching NGN rate from CoinMarketCap...');
-    const url = `https://pro-api.coinmarketcap.com/v2/tools/price-conversion?amount=1&symbol=USD&convert=NGN`;
+// Get NGN rate from CoinGecko (Free, no API key needed)
+async function fetchNGNFromCoinGecko() {
+  console.log('💱 Trying CoinGecko...');
+  
+  const url = 'https://api.coingecko.com/api/v3/simple/price';
+  
+  const response = await axios.get(url, {
+    params: {
+      ids: 'tether',
+      vs_currencies: 'ngn'
+    },
+    headers: {
+      'Accept': 'application/json'
+    },
+    timeout: 10000
+  });
+  
+  if (response.data?.tether?.ngn && parseFloat(response.data.tether.ngn) > 0) {
+    return parseFloat(response.data.tether.ngn);
+  }
+  
+  throw new Error('Invalid response format from CoinGecko');
+}
+
+// Get NGN rate from Binance P2P (Free, real market rates)
+async function fetchNGNFromBinance() {
+  console.log('💱 Trying Binance P2P...');
+  
+  const url = 'https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search';
+  
+  const response = await axios.post(url, {
+    fiat: 'NGN',
+    page: 1,
+    rows: 10,
+    tradeType: 'BUY',
+    asset: 'USDT',
+    countries: [],
+    proMerchantAds: false,
+    shieldMerchantAds: false,
+    publisherType: null,
+    payTypes: []
+  }, {
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    timeout: 10000
+  });
+  
+  if (response.data?.data && Array.isArray(response.data.data) && response.data.data.length > 0) {
+    const rates = response.data.data
+      .slice(0, 5)
+      .map(ad => parseFloat(ad.adv.price))
+      .filter(price => price > 0);
     
-    const response = await axios.get(url, {
-      headers: {
-        'X-CMC_PRO_API_KEY': COINMARKETCAP_API_KEY,
-        'Accept': 'application/json'
-      },
-      timeout: 10000
-    });
-
-    const rate = response.data?.data?.quote?.NGN?.value;
-    if (rate) {
-      console.log(`✅ CoinMarketCap NGN rate: 1 USD = ${rate} NGN`);
-      return parseFloat(rate);
+    if (rates.length > 0) {
+      const avgRate = rates.reduce((a, b) => a + b, 0) / rates.length;
+      console.log(`💱 Binance avg rate from ${rates.length} merchants: ₦${avgRate}`);
+      return avgRate;
     }
-  } catch (error) {
-    console.error(`🔶 CoinMarketCap NGN rate fetch failed: ${error.message}`);
   }
+  
+  throw new Error('Invalid response format from Binance');
+}
 
-  return null;
+// Get NGN rate from ExchangeRate-API (Free tier available)
+async function fetchNGNFromExchangeRateAPI() {
+  console.log('💱 Trying ExchangeRate-API...');
+  
+  const url = 'https://api.exchangerate-api.com/v4/latest/USD';
+  
+  const response = await axios.get(url, {
+    headers: {
+      'Accept': 'application/json'
+    },
+    timeout: 10000
+  });
+  
+  if (response.data?.rates?.NGN && parseFloat(response.data.rates.NGN) > 0) {
+    return parseFloat(response.data.rates.NGN);
+  }
+  
+  throw new Error('Invalid response format from ExchangeRate-API');
+}
+
+// Master function to fetch NGN rate with multiple fallbacks
+async function fetchNGNRate() {
+  console.log('💱 Fetching USD to NGN exchange rate...');
+  
+  const fallbackRate = 1520;
+  
+  // Try multiple sources in order of preference
+  const sources = [
+    { name: 'CoinMarketCap', func: fetchNGNFromCoinMarketCap },
+    { name: 'CoinGecko', func: fetchNGNFromCoinGecko },
+    { name: 'Binance P2P', func: fetchNGNFromBinance },
+    { name: 'ExchangeRate-API', func: fetchNGNFromExchangeRateAPI }
+  ];
+  
+  for (const source of sources) {
+    try {
+      const rate = await source.func();
+      if (rate && rate > 0) {
+        console.log(`✅ Got NGN rate: ₦${rate.toFixed(2)} from ${source.name}`);
+        return rate;
+      }
+    } catch (error) {
+      console.log(`⚠️ ${source.name} failed: ${error.message}`);
+      continue;
+    }
+  }
+  
+  console.log(`⚠️ All sources failed, using fallback rate: ₦${fallbackRate}`);
+  return fallbackRate;
+}
+
+// Get cached NGN rate with memory + database persistence
+async function getCachedNGNRate() {
+  const now = Date.now();
+  
+  // Check memory cache first
+  if (cachedNGNRate && (now - ngnRateCacheTime) < NGN_RATE_CACHE_DURATION) {
+    const ageMinutes = Math.floor((now - ngnRateCacheTime) / 60000);
+    console.log(`💱 Using cached NGN rate: ₦${cachedNGNRate.toFixed(2)} (${ageMinutes}m old)`);
+    return cachedNGNRate;
+  }
+  
+  // Fetch fresh rate
+  try {
+    const rate = await fetchNGNRate();
+    cachedNGNRate = rate;
+    ngnRateCacheTime = now;
+    return rate;
+  } catch (error) {
+    // If fetch fails but we have old cache, use it
+    if (cachedNGNRate) {
+      console.log(`⚠️ Using stale cached rate: ₦${cachedNGNRate.toFixed(2)}`);
+      return cachedNGNRate;
+    }
+    throw error;
+  }
 }
 
 // Background fetch function with rate limiting and exponential backoff
@@ -560,19 +701,8 @@ async function backgroundFetchPrices(retryCount = 0) {
             console.log('⚠️ Alchemy failed, trying CoinMarketCap...');
             try {
               originalData = await fetchPricesFromCoinMarketCap(DEFAULT_TOKENS);
-              
-              // Try to get NGN rate from CoinMarketCap
-              const cmcNgnRate = await getNGNRateFromCoinMarketCap();
-              if (cmcNgnRate) {
-                Object.keys(originalData).forEach(tokenId => {
-                  if (originalData[tokenId].usd) {
-                    originalData[tokenId].ngn = originalData[tokenId].usd * cmcNgnRate;
-                  }
-                });
-              } else {
-                // Fall back to CoinGecko rate or hardcoded fallback
-                originalData = await calculateNGNPrices(originalData);
-              }
+              // Calculate NGN prices with multi-source fallback
+              originalData = await calculateNGNPrices(originalData);
               
               source = 'coinmarketcap';
               console.log('✅ Fetched from CoinMarketCap');
@@ -918,6 +1048,107 @@ app.get('/fetch/logs', (req, res) => {
       last_successful_fetch: new Date(lastSuccessfulFetch).toISOString()
     });
   });
+});
+
+// TEST ENDPOINT: NGN rate from all sources
+app.get('/test/ngn-rate', async (req, res) => {
+  try {
+    console.log('\n💱 ========== NGN RATE TEST ==========');
+    
+    const results = {
+      sources: {},
+      final_rate: null,
+      cached: false
+    };
+    
+    // Test each source individually
+    const sources = [
+      { name: 'CoinMarketCap', func: fetchNGNFromCoinMarketCap },
+      { name: 'CoinGecko', func: fetchNGNFromCoinGecko },
+      { name: 'Binance P2P', func: fetchNGNFromBinance },
+      { name: 'ExchangeRate-API', func: fetchNGNFromExchangeRateAPI }
+    ];
+    
+    for (const source of sources) {
+      try {
+        const startTime = Date.now();
+        const rate = await source.func();
+        const responseTime = Date.now() - startTime;
+        
+        results.sources[source.name] = {
+          success: true,
+          rate: rate.toFixed(2),
+          response_time_ms: responseTime
+        };
+      } catch (error) {
+        results.sources[source.name] = {
+          success: false,
+          error: error.message
+        };
+      }
+    }
+    
+    // Get final rate using priority system
+    results.final_rate = await getCachedNGNRate();
+    results.cached = (Date.now() - ngnRateCacheTime) < NGN_RATE_CACHE_DURATION;
+    
+    console.log('💱 ========== TEST COMPLETE ==========\n');
+    
+    res.json({
+      success: true,
+      final_rate: results.final_rate.toFixed(2),
+      cached: results.cached,
+      cache_age_minutes: Math.floor((Date.now() - ngnRateCacheTime) / 60000),
+      sources_tested: results.sources,
+      cmc_api_key_configured: !!COINMARKETCAP_API_KEY,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('💱 ========== TEST FAILED ==========');
+    console.error('Error:', error.message);
+    console.log('💱 ==================================\n');
+    
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      cmc_api_key_configured: !!COINMARKETCAP_API_KEY
+    });
+  }
+});
+
+// TEST ENDPOINT: NGN price calculation
+app.get('/test/ngn-calculation', async (req, res) => {
+  try {
+    const testData = {
+      'bitcoin': { usd: 65000, ngn: null },
+      'ethereum': { usd: 3200, ngn: null },
+      'tether': { usd: 1.00, ngn: null }
+    };
+    
+    console.log('💱 Testing NGN price calculation...');
+    const result = await calculateNGNPrices(testData);
+    
+    res.json({
+      success: true,
+      ngn_rate: cachedNGNRate?.toFixed(2),
+      prices: result,
+      cache_age_minutes: Math.floor((Date.now() - ngnRateCacheTime) / 60000),
+      with_margin: Object.fromEntries(
+        Object.entries(result).map(([id, prices]) => [
+          id, 
+          { usd: prices.usd, ngn: prices.ngn, ngn_with_margin: (prices.ngn + MARGIN_NGN).toFixed(2) }
+        ])
+      ),
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
 });
 
 // Root endpoint
