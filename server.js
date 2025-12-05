@@ -203,15 +203,16 @@ async function fetchPricesFromAlchemy(tokenIds) {
     throw new Error('No valid token symbols for Alchemy');
   }
 
-  const url = `https://api.g.alchemy.com/prices/v1/${ALCHEMY_API_KEY}/tokens/by-symbol`;
+  console.log(`🔷 Fetching prices from Alchemy for: ${symbols.join(', ')}`);
+
+  // Alchemy API endpoint format: GET request with query params
+  const symbolsParam = symbols.join(',');
+  const url = `https://api.g.alchemy.com/prices/v1/${ALCHEMY_API_KEY}/tokens/by-symbol?symbols=${symbolsParam}`;
   
-  const response = await axios.post(url, {
-    symbols: symbols
-  }, {
+  const response = await axios.get(url, {
     timeout: 30000,
     headers: {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json'
+      'Accept': 'application/json'
     }
   });
 
@@ -234,6 +235,7 @@ async function fetchPricesFromAlchemy(tokenIds) {
     });
   }
 
+  console.log(`🔷 Alchemy returned ${Object.keys(transformedData).length} token prices`);
   return transformedData;
 }
 
