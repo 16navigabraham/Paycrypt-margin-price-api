@@ -7,6 +7,7 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY || '';
+const COINMARKETCAP_API_KEY = process.env.COINMARKETCAP_API_KEY || '';
 
 // CORS configuration (unchanged)
 app.use(cors({
@@ -106,6 +107,22 @@ const BASE_MAINNET_ADDRESSES = {
   'SEND': '0xeab49138ba2ea6dd776220fe26b7b8e446638956',
   'USDC': '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
   'USDT': '0xfde4c96c8593536e31f229ea8f37b2ada2699bb2'
+};
+
+// CoinMarketCap token IDs mapping
+const COINMARKETCAP_ID_MAP = {
+  'bitcoin': 1,
+  'ethereum': 1027,
+  'tether': 825,
+  'usd-coin': 3408,
+  'binancecoin': 1839,
+  'cardano': 2010,
+  'solana': 5426,
+  'polygon': 3890,
+  'chainlink': 1975,
+  'send-token-2': 29382,  // SEND token ID on CoinMarketCap
+  'celo-dollar': 5243,
+  'celo': 5567
 };
 
 // Database helper functions
@@ -366,6 +383,94 @@ async function calculateNGNPrices(tokenData) {
   return tokenData;
 }
 
+// Fetch prices from CoinMarketCap API (fallback #3)
+async function fetchPricesFromCoinMarketCap(tokenIds) {
+  if (!COINMARKETCAP_API_KEY) {
+    throw new Error('CoinMarketCap API key not configured');
+  }
+
+  const cmcIds = tokenIds
+    .map(id => COINMARKETCAP_ID_MAP[id])
+    .filter(id => id);
+
+  if (cmcIds.length === 0) {
+    throw new Error('No valid CoinMarketCap IDs for tokens');
+  }
+
+  console.log(`🔶 Fetching prices from CoinMarketCap for ${cmcIds.length} tokens...`);
+
+  const url = `https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?id=${cmcIds.join(',')}&convert=USD`;
+  
+  try {
+    const response = await axios.get(url, {
+      headers: {
+        'X-CMC_PRO_API_KEY': COINMARKETCAP_API_KEY,
+        'Accept': 'application/json'
+      },
+      timeout: 30000
+    });
+
+    const transformedData = {};
+    const data = response.data?.data || {};
+    
+    console.log(`🔶 CoinMarketCap returned ${Object.keys(data).length} tokens`);
+
+    // Map response back to CoinGecko IDs
+    Object.entries(data).forEach(([cmcId, tokenData]) => {
+      const tokenId = Object.keys(COINMARKETCAP_ID_MAP).find(
+        key => COINMARKETCAP_ID_MAP[key] == cmcId
+      );
+      
+      if (tokenId && tokenData.quote?.USD?.price) {
+        transformedData[tokenId] = {
+          usd: parseFloat(tokenData.quote.USD.price),
+          ngn: null
+        };
+        console.log(`✅ ${tokenId}: $${tokenData.quote.USD.price}`);
+      }
+    });
+
+    return transformedData;
+  } catch (error) {
+    console.error(`🔶 CoinMarketCap API Error: ${error.message}`);
+    if (error.response) {
+      console.error(`🔶 Status: ${error.response.status}`);
+      console.error(`🔶 Response:`, error.response.data?.status?.error_message || error.response.data);
+    }
+    throw error;
+  }
+}
+
+// Get NGN rate from CoinMarketCap (independent source for NGN conversion)
+async function getNGNRateFromCoinMarketCap() {
+  if (!COINMARKETCAP_API_KEY) {
+    return null;
+  }
+
+  try {
+    console.log('🔶 Fetching NGN rate from CoinMarketCap...');
+    const url = `https://pro-api.coinmarketcap.com/v2/tools/price-conversion?amount=1&symbol=USD&convert=NGN`;
+    
+    const response = await axios.get(url, {
+      headers: {
+        'X-CMC_PRO_API_KEY': COINMARKETCAP_API_KEY,
+        'Accept': 'application/json'
+      },
+      timeout: 10000
+    });
+
+    const rate = response.data?.data?.quote?.NGN?.value;
+    if (rate) {
+      console.log(`✅ CoinMarketCap NGN rate: 1 USD = ${rate} NGN`);
+      return parseFloat(rate);
+    }
+  } catch (error) {
+    console.error(`🔶 CoinMarketCap NGN rate fetch failed: ${error.message}`);
+  }
+
+  return null;
+}
+
 // Background fetch function with rate limiting and exponential backoff
 async function backgroundFetchPrices(retryCount = 0) {
   if (isFetching) {
@@ -430,7 +535,35 @@ async function backgroundFetchPrices(retryCount = 0) {
           console.log('✅ Fetched from Alchemy');
         } catch (alchemyError) {
           console.error('❌ Alchemy fetch failed:', alchemyError.message);
-          throw coinGeckoError; // Throw original CoinGecko error
+          
+          // Try CoinMarketCap as third fallback
+          if (COINMARKETCAP_API_KEY) {
+            console.log('⚠️ Alchemy failed, trying CoinMarketCap...');
+            try {
+              originalData = await fetchPricesFromCoinMarketCap(DEFAULT_TOKENS);
+              
+              // Try to get NGN rate from CoinMarketCap
+              const cmcNgnRate = await getNGNRateFromCoinMarketCap();
+              if (cmcNgnRate) {
+                Object.keys(originalData).forEach(tokenId => {
+                  if (originalData[tokenId].usd) {
+                    originalData[tokenId].ngn = originalData[tokenId].usd * cmcNgnRate;
+                  }
+                });
+              } else {
+                // Fall back to CoinGecko rate or hardcoded fallback
+                originalData = await calculateNGNPrices(originalData);
+              }
+              
+              source = 'coinmarketcap';
+              console.log('✅ Fetched from CoinMarketCap');
+            } catch (cmcError) {
+              console.error('❌ CoinMarketCap fetch failed:', cmcError.message);
+              throw coinGeckoError; // Throw original CoinGecko error
+            }
+          } else {
+            throw coinGeckoError; // Throw original CoinGecko error
+          }
         }
       } else {
         throw coinGeckoError; // Re-throw if not rate limit or no Alchemy key

@@ -3,3 +3,5 @@ dist/
 .env
 .DS_Store
 API_USAGE.md
+
+COINMARKETCAP_INTEGRATION.md
