@@ -74,7 +74,7 @@ let rateLimitedUntil = 0;
 const BACKGROUND_FETCH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 const CACHE_FRESH_DURATION = 10 * 60 * 1000; // 10 minutes (consider fresh)
 const CACHE_STALE_DURATION = 2 * 60 * 60 * 1000; // 2 hours (still usable)
-const MIN_REQUEST_INTERVAL = 65 * 1000; // Minimum 65 seconds between CoinGecko requests
+const MIN_REQUEST_INTERVAL = 2 * 1000; // Minimum 2 seconds between CoinGecko requests (allows ~30 req/min)
 const MAX_RETRIES = 3;
 const INITIAL_RETRY_DELAY = 10 * 1000; // 10 seconds
 
