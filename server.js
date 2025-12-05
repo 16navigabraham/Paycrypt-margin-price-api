@@ -16,6 +16,7 @@ app.use(cors({
     'https://paycrypt.org',
     'http://localhost:5173',
     'https://miniapp.paycrypt.org',
+    'https://paycrypt-admin-backend.onrender.com',
     'http://localhost:3000'
   ]
 }));
