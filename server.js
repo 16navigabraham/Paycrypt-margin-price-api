@@ -204,13 +204,16 @@ async function fetchPricesFromAlchemy(tokenIds) {
   }
 
   console.log(`🔷 Fetching prices from Alchemy for: ${symbols.join(', ')}`);
+  console.log(`🔷 API Key configured: ${ALCHEMY_API_KEY ? 'Yes' : 'No'}`);
 
-  // Alchemy API endpoint format: POST request with JSON body containing symbols array
   const url = `https://api.g.alchemy.com/prices/v1/${ALCHEMY_API_KEY}/tokens/by-symbol`;
   
   try {
+    console.log(`🔷 POST to: ${url}`);
+    console.log(`🔷 Sending symbols: ${JSON.stringify(symbols)}`);
+    
     const response = await axios.post(url, {
-      symbols: symbols  // Send as array, not comma-separated string
+      symbols: symbols
     }, {
       timeout: 30000,
       headers: {
@@ -220,7 +223,7 @@ async function fetchPricesFromAlchemy(tokenIds) {
     });
 
     console.log(`🔷 Alchemy response status: ${response.status}`);
-    console.log(`🔷 Alchemy response keys:`, Object.keys(response.data));
+    console.log(`🔷 Alchemy response type: ${typeof response.data}`);
 
     // Transform Alchemy response to match CoinGecko format
     const transformedData = {};
@@ -230,16 +233,14 @@ async function fetchPricesFromAlchemy(tokenIds) {
     if (response.data && response.data.data && Array.isArray(response.data.data)) {
       tokenDataArray = response.data.data;
       console.log(`🔷 Response structure: data array with ${tokenDataArray.length} items`);
-      console.log(`🔷 First item:`, JSON.stringify(tokenDataArray[0]).substring(0, 300));
     } else if (Array.isArray(response.data)) {
       tokenDataArray = response.data;
+      console.log(`🔷 Response structure: direct array with ${tokenDataArray.length} items`);
     }
 
     console.log(`🔷 Processing ${tokenDataArray.length} tokens from Alchemy response`);
 
     tokenDataArray.forEach((tokenData, index) => {
-      console.log(`🔷 Token ${index}:`, JSON.stringify(tokenData).substring(0, 200));
-      
       // Find the token ID from symbol
       const tokenId = Object.keys(TOKEN_SYMBOL_MAP).find(
         key => TOKEN_SYMBOL_MAP[key] === tokenData.symbol
@@ -255,7 +256,6 @@ async function fetchPricesFromAlchemy(tokenIds) {
           if (usdPriceObj && usdPriceObj.value) {
             usdPrice = usdPriceObj.value;
           } else if (tokenData.prices.length > 0 && tokenData.prices[0].value) {
-            // Fallback to first price if no USD found
             usdPrice = tokenData.prices[0].value;
           }
         } else if (tokenData.price) {
@@ -282,7 +282,12 @@ async function fetchPricesFromAlchemy(tokenIds) {
     console.error(`🔷 Alchemy API Error: ${error.message}`);
     if (error.response) {
       console.error(`🔷 Status: ${error.response.status}`);
-      console.error(`🔷 Response keys:`, Object.keys(error.response.data || {}));
+      console.error(`🔷 Response type: ${typeof error.response.data}`);
+      if (typeof error.response.data === 'string') {
+        console.error(`🔷 Response (string): ${error.response.data.substring(0, 200)}`);
+      } else {
+        console.error(`🔷 Response (object):`, JSON.stringify(error.response.data).substring(0, 200));
+      }
     }
     throw error;
   }
