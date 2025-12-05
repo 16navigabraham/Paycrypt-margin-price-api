@@ -212,13 +212,18 @@ async function fetchPricesFromAlchemy(tokenIds) {
     console.log(`🔷 POST to: ${url}`);
     console.log(`🔷 Sending symbols: ${JSON.stringify(symbols)}`);
     
-    const response = await axios.post(url, {
-      symbols: symbols
-    }, {
+    // Build query parameters for symbols
+    const params = new URLSearchParams();
+    symbols.forEach(symbol => {
+      params.append('symbols', symbol);
+    });
+    
+    console.log(`🔷 Query params: ${params.toString()}`);
+    
+    const response = await axios.post(`${url}?${params.toString()}`, {}, {
       timeout: 30000,
       headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
+        'Accept': 'application/json'
       }
     });
 
