@@ -24,7 +24,7 @@ app.use(cors({
 }));
 
 // Your margin in Naira
-const MARGIN_NGN = 50;
+const MARGIN_NGN = 100;
 
 // Database setup
 const dbPath = path.join(__dirname, 'price_cache.db');
